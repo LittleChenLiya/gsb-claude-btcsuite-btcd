@@ -572,6 +572,176 @@ func TestOrphanReject(t *testing.T) {
 	}
 }
 
+// TestOrphanRejectionTrace ensures that orphan transactions are properly
+// traced when they are not accepted into the transaction pool.  In
+// particular, it verifies that:
+//
+//  1. An orphan that is missing parent transactions is traced with the
+//     missing parents as a TEMPORARY rejection (it must not be reported as
+//     permanently invalid) and is cached in the orphan pool.
+//  2. Once the missing parent arrives, the orphan is accepted into the
+//     transaction pool and its temporary rejection trace is cleared.
+//  3. An orphan that violates a policy (it is too large to be cached) is
+//     traced with the permanent policy rejection and is not cached.
+func TestOrphanRejectionTrace(t *testing.T) {
+	t.Parallel()
+
+	harness, outputs, err := newPoolHarness(&chaincfg.MainNetParams)
+	if err != nil {
+		t.Fatalf("unable to create test pool: %v", err)
+	}
+	tc := &testContext{t, harness}
+
+	// ------------------------------------------------------------------
+	// Scenario 1: missing parent (temporary orphan).
+	// ------------------------------------------------------------------
+
+	// Create a chain of two transactions: parent -> child.  Submit the
+	// child first so it becomes an orphan missing its parent.
+	chainedTxns, err := harness.CreateTxChain(outputs[0], 2)
+	if err != nil {
+		t.Fatalf("unable to create transaction chain: %v", err)
+	}
+	parentTx := chainedTxns[0]
+	childTx := chainedTxns[1]
+
+	acceptedTxns, err := harness.txPool.ProcessTransaction(childTx, true,
+		false, 0)
+	if err != nil {
+		t.Fatalf("ProcessTransaction: failed to accept valid orphan: %v",
+			err)
+	}
+	if len(acceptedTxns) != 0 {
+		t.Fatalf("ProcessTransaction: reported %d accepted transactions "+
+			"from what should be an orphan", len(acceptedTxns))
+	}
+
+	// The child should be in the orphan pool, not the transaction pool.
+	testPoolMembership(tc, childTx, true, false)
+
+	// The trace should record the missing parents as a temporary
+	// rejection.
+	childHash := childTx.Hash()
+	rejection := harness.txPool.OrphanRejection(childHash)
+	if rejection == nil {
+		t.Fatalf("OrphanRejection: expected a rejection trace for orphan %v",
+			childHash)
+	}
+	if rejection.Reason != OrphanRejectMissingParents {
+		t.Fatalf("OrphanRejection: expected reason %v (missing parents), "+
+			"got %v", OrphanRejectMissingParents, rejection.Reason)
+	}
+	if len(rejection.MissingParents) != 1 {
+		t.Fatalf("OrphanRejection: expected 1 missing parent, got %d",
+			len(rejection.MissingParents))
+	}
+	if !rejection.MissingParents[0].IsEqual(parentTx.Hash()) {
+		t.Fatalf("OrphanRejection: missing parent hash mismatch -- got %v, "+
+			"want %v", rejection.MissingParents[0], parentTx.Hash())
+	}
+
+	// A temporary missing-parents rejection must NOT carry a reject code
+	// since it is not a permanent rejection.
+	if rejection.RejectCode != 0 {
+		t.Fatalf("OrphanRejection: temporary missing-parents rejection must "+
+			"not carry a reject code, got %v", rejection.RejectCode)
+	}
+	if rejection.Time.IsZero() {
+		t.Fatalf("OrphanRejection: expected a non-zero rejection time")
+	}
+
+	// The returned trace must be a copy so callers can't mutate internal
+	// state.  Mutating it must not affect a subsequent read.
+	rejection.Reason = OrphanRejectPolicy
+	rejection2 := harness.txPool.OrphanRejection(childHash)
+	if rejection2 == nil || rejection2.Reason != OrphanRejectMissingParents {
+		t.Fatalf("OrphanRejection: returned trace is not a copy -- internal "+
+			"state was mutated")
+	}
+
+	// ------------------------------------------------------------------
+	// Scenario 2: supply the missing parent (orphan becomes valid).
+	// ------------------------------------------------------------------
+
+	acceptedTxns, err = harness.txPool.ProcessTransaction(parentTx, false,
+		false, 0)
+	if err != nil {
+		t.Fatalf("ProcessTransaction: failed to accept valid parent: %v",
+			err)
+	}
+	if len(acceptedTxns) != 2 {
+		t.Fatalf("ProcessTransaction: reported %d accepted transactions, "+
+			"want 2 (parent + child)", len(acceptedTxns))
+	}
+
+	// Both transactions should now be in the transaction pool and not in
+	// the orphan pool.
+	testPoolMembership(tc, parentTx, false, true)
+	testPoolMembership(tc, childTx, false, true)
+
+	// The temporary rejection trace should be cleared once the parent
+	// arrives and the orphan is accepted.
+	rejection = harness.txPool.OrphanRejection(childHash)
+	if rejection != nil {
+		t.Fatalf("OrphanRejection: expected trace to be cleared after the "+
+			"missing parent arrived, got %+v", rejection)
+	}
+
+	// ------------------------------------------------------------------
+	// Scenario 3: policy rejection (orphan too large to cache).
+	// ------------------------------------------------------------------
+
+	// Use a fresh spendable output for this scenario and set a very small
+	// max orphan transaction size so the orphan is rejected by policy.
+	freshCoinbase := tc.addCoinbaseTx(1)
+	freshOutput := txOutToSpendableOut(freshCoinbase, 0)
+	harness.txPool.cfg.Policy.MaxOrphanTxSize = 10
+
+	chainedTxns2, err := harness.CreateTxChain(freshOutput, 2)
+	if err != nil {
+		t.Fatalf("unable to create transaction chain: %v", err)
+	}
+	oversizedOrphan := chainedTxns2[1]
+
+	acceptedTxns, err = harness.txPool.ProcessTransaction(oversizedOrphan,
+		true, false, 0)
+	if err == nil {
+		t.Fatalf("ProcessTransaction: expected a policy rejection for an "+
+			"oversized orphan")
+	}
+	if len(acceptedTxns) != 0 {
+		t.Fatalf("ProcessTransaction: reported %d accepted transactions "+
+			"from a rejected orphan", len(acceptedTxns))
+	}
+
+	// The orphan should not be in either pool.
+	testPoolMembership(tc, oversizedOrphan, false, false)
+
+	// The trace should record the permanent policy rejection.
+	orphanHash := oversizedOrphan.Hash()
+	rejection = harness.txPool.OrphanRejection(orphanHash)
+	if rejection == nil {
+		t.Fatalf("OrphanRejection: expected a policy rejection trace for "+
+			"orphan %v", orphanHash)
+	}
+	if rejection.Reason != OrphanRejectPolicy {
+		t.Fatalf("OrphanRejection: expected reason %v (policy), got %v",
+			OrphanRejectPolicy, rejection.Reason)
+	}
+	if rejection.RejectCode != wire.RejectNonstandard {
+		t.Fatalf("OrphanRejection: expected reject code %v, got %v",
+			wire.RejectNonstandard, rejection.RejectCode)
+	}
+	if len(rejection.MissingParents) != 0 {
+		t.Fatalf("OrphanRejection: policy rejection must not list missing "+
+			"parents, got %v", rejection.MissingParents)
+	}
+	if rejection.Description == "" {
+		t.Fatalf("OrphanRejection: expected a non-empty description for the " +
+			"policy rejection")
+	}
+}
+
 // TestOrphanEviction ensures that exceeding the maximum number of orphans
 // evicts entries to make room for the new ones.
 func TestOrphanEviction(t *testing.T) {
