@@ -193,6 +193,11 @@ type BlockChain struct {
 	// certain blockchain events.
 	notificationsLock sync.RWMutex
 	notifications     []NotificationCallback
+
+	// lastReorgReport stores the read-only height difference report of the
+	// most recent successful chain reorganization.  It is protected by the
+	// chain lock.
+	lastReorgReport *ReorgReport
 }
 
 // HaveBlock returns whether or not the chain instance has the block data
@@ -496,6 +501,76 @@ func LockTimeToSequence(isSeconds bool, locktime uint32) uint32 {
 	// 33,553,920 seconds, or 1.1 years.
 	return wire.SequenceLockTimeIsSeconds |
 		locktime>>wire.SequenceLockTimeGranularity
+}
+
+// ReorgReport is a read-only report that describes the height difference
+// caused by a successful chain reorganization.  It lists the common ancestor
+// (fork point) of the two chains along with the number of blocks that were
+// rolled back (detached) from the previous main chain and the number of
+// blocks that were connected (attached) from the new main chain.
+//
+// The report is generated at the chain reorganization decision point and is
+// only published for successful reorganizations that actually detached and/or
+// attached blocks.  Callers must treat it as read-only.
+type ReorgReport struct {
+	// ForkHash is the hash of the common ancestor of the previous and the
+	// new main chain.
+	ForkHash chainhash.Hash
+
+	// ForkHeight is the height of the common ancestor of the previous and
+	// the new main chain.
+	ForkHeight int32
+
+	// DetachBlocks is the number of blocks that were rolled back
+	// (disconnected) from the previous main chain.
+	DetachBlocks int32
+
+	// AttachBlocks is the number of blocks that were connected to form the
+	// new main chain.
+	AttachBlocks int32
+}
+
+// Depth returns the total number of blocks affected by the reorganization,
+// that is, the sum of the detached and attached blocks.  A depth of zero
+// means no rollback took place.
+func (r ReorgReport) Depth() int32 {
+	return r.DetachBlocks + r.AttachBlocks
+}
+
+// HeightDelta returns the change in the best chain height caused by the
+// reorganization.  It is positive when the new main chain is longer than the
+// previous one.
+func (r ReorgReport) HeightDelta() int32 {
+	return r.AttachBlocks - r.DetachBlocks
+}
+
+// String returns a human-readable representation of the report.
+func (r ReorgReport) String() string {
+	return fmt.Sprintf("reorg report: fork at height %d/block %v, "+
+		"detached %d block(s), attached %d block(s), height delta %+d",
+		r.ForkHeight, r.ForkHash, r.DetachBlocks, r.AttachBlocks,
+		r.HeightDelta())
+}
+
+// LastReorgReport returns a copy of the report for the most recent successful
+// chain reorganization that detached and/or attached blocks.  It returns nil
+// when no such reorganization has occurred yet.
+//
+// A failed reorganization never publishes a report and a reorganization
+// decision with zero depth (nothing to detach or attach) never triggers a
+// rollback report.
+//
+// The returned report is a copy, so callers may not mutate the chain's
+// internal state through it.
+func (b *BlockChain) LastReorgReport() *ReorgReport {
+	b.chainLock.RLock()
+	defer b.chainLock.RUnlock()
+
+	if b.lastReorgReport == nil {
+		return nil
+	}
+	report := *b.lastReorgReport
+	return &report
 }
 
 // getReorganizeNodes finds the fork point between the main chain and the passed
@@ -1279,9 +1354,31 @@ func (b *BlockChain) connectBestChain(node *blockNode, block *btcutil.Block, fla
 	// common ancenstor (the point where the chain forked).
 	detachNodes, attachNodes := b.getReorganizeNodes(node)
 
+	// Find the common ancestor of the two chains for the reorganization
+	// report before the reorganization modifies the best chain.
+	forkNode := b.bestChain.FindFork(node)
+
 	// Reorganize the chain.
 	log.Infof("REORGANIZE: Block %v is causing a reorganize.", node.hash)
 	err := b.reorganizeChain(detachNodes, attachNodes)
+
+	// Publish a read-only height difference report for the reorganization.
+	// A report is only published when the reorganization succeeded and
+	// actually detached and/or attached blocks.  A zero depth reorganization
+	// must not trigger a rollback report and a failed reorganization never
+	// publishes a success report.
+	if err == nil && detachNodes.Len()+attachNodes.Len() > 0 {
+		report := &ReorgReport{
+			DetachBlocks: int32(detachNodes.Len()),
+			AttachBlocks: int32(attachNodes.Len()),
+		}
+		if forkNode != nil {
+			report.ForkHash = forkNode.hash
+			report.ForkHeight = forkNode.height
+		}
+		b.lastReorgReport = report
+		log.Infof("REORGANIZE: %v", report)
+	}
 
 	// Either getReorganizeNodes or reorganizeChain could have made unsaved
 	// changes to the block index, so flush regardless of whether there was an
