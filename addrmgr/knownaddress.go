@@ -20,6 +20,7 @@ type KnownAddress struct {
 	attempts    int
 	lastattempt time.Time
 	lastsuccess time.Time
+	lastfail    time.Time
 	tried       bool
 	refs        int // reference count of new buckets
 }
@@ -37,6 +38,16 @@ func (ka *KnownAddress) LastAttempt() time.Time {
 	ka.mtx.RLock()
 	defer ka.mtx.RUnlock()
 	return ka.lastattempt
+}
+
+// LastFailed returns the last time an attempt to connect to the known address
+// was reported as failed via AddrManager.Failed.  It returns the zero time if
+// the address has never been reported as failed (or the failure was cleared by
+// a later success).
+func (ka *KnownAddress) LastFailed() time.Time {
+	ka.mtx.RLock()
+	defer ka.mtx.RUnlock()
+	return ka.lastfail
 }
 
 // Services returns the services supported by the peer with the known address.

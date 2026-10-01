@@ -34,5 +34,12 @@ provided by the caller about connected, known good, and attempted addresses to
 periodically purge peers which no longer appear to be good peers as well as
 bias the selection toward known good peers.  The general idea is to make a best
 effort at only providing usable addresses.
+
+Callers may additionally enable a failure cooldown window using the
+WithFailureCooldown option: addresses reported as failed via Failed are
+temporarily skipped by GetAddress until the window elapses (or the address
+succeeds), and when every candidate is cooling down GetAddress returns nil.
+The option is off by default and the historical selection strategy is left
+unchanged.
 */
 package addrmgr
