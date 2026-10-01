@@ -557,6 +557,55 @@ func (b *BlockChain) getReorganizeNodes(node *blockNode) (*list.List, *list.List
 	return detachNodes, attachNodes
 }
 
+// newReorganizationReport builds a read-only height difference report for a
+// pending chain reorganization.  It records the common ancestor (fork point)
+// of the current best chain and the new chain along with the number of blocks
+// that would be rolled back (detached from the old chain) and connected
+// (attached to the new chain).
+//
+// The report is a snapshot of the decision and does not mutate any chain
+// state.  It is generated at the point the reorganization is decided, before
+// the chain is modified.
+//
+// This function MUST be called with the chain state lock held (for writes).
+func (b *BlockChain) newReorganizationReport(node *blockNode, detachNodes,
+	attachNodes *list.List) *ReorganizationReport {
+
+	oldTip := b.bestChain.Tip()
+
+	// The fork point is the common ancestor of the old and new best chains.
+	// It is the parent of the first node to attach (equivalently the parent
+	// of the last node to detach).  Fall back to the current tip if neither
+	// list is populated.
+	var forkNode *blockNode
+	if attachNodes.Len() > 0 {
+		forkNode = attachNodes.Front().Value.(*blockNode).parent
+	} else if detachNodes.Len() > 0 {
+		forkNode = detachNodes.Back().Value.(*blockNode).parent
+	}
+	if forkNode == nil {
+		forkNode = oldTip
+	}
+
+	// The new best tip is the last node to attach; if there are no nodes to
+	// attach, the tip is unchanged.
+	newTip := oldTip
+	if attachNodes.Len() > 0 {
+		newTip = attachNodes.Back().Value.(*blockNode)
+	}
+
+	return &ReorganizationReport{
+		ForkHash:      forkNode.hash,
+		ForkHeight:    forkNode.height,
+		OldBestHash:   oldTip.hash,
+		OldBestHeight: oldTip.height,
+		NewBestHash:   newTip.hash,
+		NewBestHeight: newTip.height,
+		DetachCount:   int32(detachNodes.Len()),
+		AttachCount:   int32(attachNodes.Len()),
+	}
+}
+
 // connectBlock handles connecting the passed node/block to the end of the main
 // (best) chain.
 //
@@ -895,35 +944,39 @@ func (b *BlockChain) reorganizeChain(detachNodes, attachNodes *list.List) error 
 	view := NewUtxoViewpoint()
 	view.SetBestHash(&b.bestChain.Tip().hash)
 
-	// Disconnect blocks from the main chain.
-	for i, e := 0, detachNodes.Front(); e != nil; i, e = i+1, e.Next() {
-		n := e.Value.(*blockNode)
-		block := detachBlocks[i]
+	// Disconnect blocks from the main chain.  A reorg depth of zero (no
+	// blocks to detach) means there is nothing to roll back, so the
+	// disconnect phase is skipped entirely.
+	if detachNodes.Len() > 0 {
+		for i, e := 0, detachNodes.Front(); e != nil; i, e = i+1, e.Next() {
+			n := e.Value.(*blockNode)
+			block := detachBlocks[i]
 
-		// Load all of the utxos referenced by the block that aren't
-		// already in the view.
-		err := view.fetchInputUtxos(b.utxoCache, block)
-		if err != nil {
-			return err
+			// Load all of the utxos referenced by the block that aren't
+			// already in the view.
+			err := view.fetchInputUtxos(b.utxoCache, block)
+			if err != nil {
+				return err
+			}
+
+			// Update the view to unspend all of the spent txos and remove
+			// the utxos created by the block.
+			err = view.disconnectTransactions(
+				b.db, block, detachSpentTxOuts[i],
+			)
+			if err != nil {
+				return err
+			}
+
+			// Update the database and chain state. The cache will be flushed
+			// here before the utxoview modifications happen to the database.
+			err = b.disconnectBlock(n, block, view)
+			if err != nil {
+				return err
+			}
+
+			newBest = n.parent
 		}
-
-		// Update the view to unspend all of the spent txos and remove
-		// the utxos created by the block.
-		err = view.disconnectTransactions(
-			b.db, block, detachSpentTxOuts[i],
-		)
-		if err != nil {
-			return err
-		}
-
-		// Update the database and chain state. The cache will be flushed
-		// here before the utxoview modifications happen to the database.
-		err = b.disconnectBlock(n, block, view)
-		if err != nil {
-			return err
-		}
-
-		newBest = n.parent
 	}
 
 	// Set the fork point only if there are nodes to attach since otherwise
@@ -1279,9 +1332,21 @@ func (b *BlockChain) connectBestChain(node *blockNode, block *btcutil.Block, fla
 	// common ancenstor (the point where the chain forked).
 	detachNodes, attachNodes := b.getReorganizeNodes(node)
 
+	// Generate a read-only height difference report at the reorg decision
+	// point.  The report captures the common ancestor and the number of
+	// blocks that will be rolled back and connected.  It is only published
+	// to subscribers after the reorganization completes successfully.
+	report := b.newReorganizationReport(node, detachNodes, attachNodes)
+
 	// Reorganize the chain.
 	log.Infof("REORGANIZE: Block %v is causing a reorganize.", node.hash)
 	err := b.reorganizeChain(detachNodes, attachNodes)
+
+	// Publish the reorganization report only on success.  A failed
+	// reorganization must never produce a success report.
+	if err == nil {
+		b.sendNotification(NTReorganization, report)
+	}
 
 	// Either getReorganizeNodes or reorganizeChain could have made unsaved
 	// changes to the block index, so flush regardless of whether there was an
