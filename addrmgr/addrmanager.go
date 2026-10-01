@@ -47,6 +47,16 @@ type AddrManager struct {
 	lamtx          sync.Mutex
 	localAddresses map[string]*localAddress
 	version        int
+
+	// cooldownDuration is the length of time after a failed connection
+	// attempt during which an address is skipped by GetAddress. A value of
+	// zero (the default) disables the cooldown entirely and preserves the
+	// original selection behavior.
+	cooldownDuration time.Duration
+
+	// now returns the current time. It defaults to time.Now but can be
+	// overridden in tests to drive the clock deterministically.
+	now func() time.Time
 }
 
 type serializedKnownAddress struct {
@@ -791,12 +801,25 @@ func NetAddressKey(na *wire.NetAddressV2) string {
 // random one from the possible addresses with preference given to ones that
 // have not been used recently and should not pick 'close' addresses
 // consecutively.
+//
+// When a failure cooldown window is configured, addresses that failed within
+// the window are temporarily skipped. If every known address is currently
+// cooling down, nil is returned to signal a clear empty result rather than
+// spinning indefinitely.
 func (a *AddrManager) GetAddress() *KnownAddress {
 	// Protect concurrent access.
 	a.mtx.Lock()
 	defer a.mtx.Unlock()
 
 	if a.numAddresses() == 0 {
+		return nil
+	}
+
+	// If a failure cooldown is in effect and no address is eligible, return
+	// a clear empty result instead of looping forever.
+	if a.cooldownDuration > 0 && !a.hasSelectableAddress() {
+		log.Debugf("All %d addresses are within the failure cooldown; "+
+			"returning empty result", a.numAddresses())
 		return nil
 	}
 
@@ -819,6 +842,13 @@ func (a *AddrManager) GetAddress() *KnownAddress {
 				e = e.Next()
 			}
 			ka := e.Value.(*KnownAddress)
+			if a.coolingDown(ka) {
+				// Recently failed addresses are skipped. Grow
+				// the acceptance factor so that once the
+				// cooldown expires selection remains quick.
+				factor *= 1.2
+				continue
+			}
 			randval := a.rand.Intn(large)
 			if float64(randval) < (factor * ka.chance() * float64(large)) {
 				log.Tracef("Selected %v from tried bucket",
@@ -846,6 +876,13 @@ func (a *AddrManager) GetAddress() *KnownAddress {
 					ka = value
 				}
 				nth--
+			}
+			if a.coolingDown(ka) {
+				// Recently failed addresses are skipped. Grow
+				// the acceptance factor so that once the
+				// cooldown expires selection remains quick.
+				factor *= 1.2
+				continue
 			}
 			randval := a.rand.Intn(large)
 			if float64(randval) < (factor * ka.chance() * float64(large)) {
@@ -880,6 +917,48 @@ func (a *AddrManager) Attempt(addr *wire.NetAddressV2) {
 	ka.attempts++
 	ka.lastattempt = now
 	ka.mtx.Unlock()
+}
+
+// Failed marks the given address as having failed a connection attempt at the
+// current time. The address is skipped by GetAddress for the configured
+// failure cooldown window. If the address is unknown to the address manager
+// it is ignored.
+func (a *AddrManager) Failed(addr *wire.NetAddressV2) {
+	a.mtx.Lock()
+	defer a.mtx.Unlock()
+
+	ka := a.find(addr)
+	if ka == nil {
+		return
+	}
+
+	now := a.now()
+	ka.mtx.Lock()
+	ka.lastfailure = now
+	ka.mtx.Unlock()
+}
+
+// coolingDown reports whether the given address is currently within the
+// failure cooldown window and therefore ineligible for selection. It must be
+// called with the manager's mutex held so that the lastfailure field is
+// synchronized.
+func (a *AddrManager) coolingDown(ka *KnownAddress) bool {
+	if a.cooldownDuration <= 0 || ka.lastfailure.IsZero() {
+		return false
+	}
+	return a.now().Sub(ka.lastfailure) < a.cooldownDuration
+}
+
+// hasSelectableAddress reports whether at least one known address is not
+// currently within the failure cooldown window. It must be called with the
+// manager's mutex held.
+func (a *AddrManager) hasSelectableAddress() bool {
+	for _, ka := range a.addrIndex {
+		if !a.coolingDown(ka) {
+			return true
+		}
+	}
+	return false
 }
 
 // Connected Marks the given address as currently connected and working at the
@@ -926,6 +1005,9 @@ func (a *AddrManager) Good(addr *wire.NetAddressV2) {
 	ka.lastsuccess = now
 	ka.lastattempt = now
 	ka.attempts = 0
+	// A successful connection clears any prior failure so the address is
+	// immediately eligible for selection again.
+	ka.lastfailure = time.Time{}
 	ka.mtx.Unlock() // tried and refs synchronized via a.mtx
 
 	// move to tried set, optionally evicting other addresses if need.
@@ -1202,9 +1284,22 @@ func (a *AddrManager) GetBestLocalAddress(remoteAddr *wire.NetAddressV2) *wire.N
 	return bestAddress
 }
 
+// Option configures an AddrManager.
+type Option func(*AddrManager)
+
+// WithFailureCooldown returns an option that sets the duration for which a
+// recently failed address is skipped during address selection. A duration of
+// zero (the default) disables the failure cooldown entirely, preserving the
+// original selection behavior.
+func WithFailureCooldown(d time.Duration) Option {
+	return func(a *AddrManager) {
+		a.cooldownDuration = d
+	}
+}
+
 // New returns a new bitcoin address manager.
 // Use Start to begin processing asynchronous address updates.
-func New(dataDir string, lookupFunc func(string) ([]net.IP, error)) *AddrManager {
+func New(dataDir string, lookupFunc func(string) ([]net.IP, error), opts ...Option) *AddrManager {
 	am := AddrManager{
 		peersFile:      filepath.Join(dataDir, "peers.json"),
 		lookupFunc:     lookupFunc,
@@ -1212,6 +1307,10 @@ func New(dataDir string, lookupFunc func(string) ([]net.IP, error)) *AddrManager
 		quit:           make(chan struct{}),
 		localAddresses: make(map[string]*localAddress),
 		version:        serialisationVersion,
+		now:            time.Now,
+	}
+	for _, opt := range opts {
+		opt(&am)
 	}
 	am.reset()
 	return &am

@@ -2008,6 +2008,11 @@ func (s *server) handleDonePeerMsg(state *peerState, sp *serverPeer) {
 		}
 		delete(list, sp.ID())
 		srvrLog.Debugf("Removed peer %s", sp)
+	} else if !sp.Inbound() && sp.NA() != nil {
+		// An outbound peer that was never added failed to complete the
+		// connection/handshake. Record the failure so the address
+		// manager applies its failure cooldown window to the address.
+		s.addrManager.Failed(sp.NA())
 	}
 
 	// Notify the sync manager the peer is gone and evict any
@@ -2387,6 +2392,27 @@ func (s *server) inboundPeerConnected(conn net.Conn) {
 	sp.Peer = peer.NewInboundPeer(peerCfg)
 	sp.AssociateConnection(conn)
 	go s.peerLifecycleHandler(sp)
+}
+
+// markConnReqFailed records a failed outbound connection attempt for the
+// address backing the given connection request so that the address manager can
+// apply its failure cooldown window. Connection requests that do not correspond
+// to a known address are ignored.
+func (s *server) markConnReqFailed(c *connmgr.ConnReq) {
+	if c == nil || c.Addr == nil || s.addrManager == nil {
+		return
+	}
+
+	na, err := s.addrManager.DeserializeNetAddress(
+		c.Addr.String(), wire.SFNodeNetwork,
+	)
+	if err != nil {
+		srvrLog.Debugf("Unable to mark failed address %s: %v",
+			c.Addr, err)
+		return
+	}
+
+	s.addrManager.Failed(na)
 }
 
 // outboundPeerConnected is invoked by the connection manager when a new
@@ -3264,14 +3290,15 @@ func newServer(listenAddrs, agentBlacklist, agentWhitelist []string,
 			"reserved-outbound=%d", cfg.MaxPeers, reservedOutbound)
 	}
 	cmgr, err := connmgr.New(&connmgr.Config{
-		Listeners:      listeners,
-		OnAccept:       s.inboundPeerConnected,
-		MaxInbound:     &maxInbound,
-		RetryDuration:  connectionRetryInterval,
-		TargetOutbound: uint32(targetOutbound),
-		Dial:           btcdDial,
-		OnConnection:   s.outboundPeerConnected,
-		GetNewAddress:  newAddressFunc,
+		Listeners:         listeners,
+		OnAccept:          s.inboundPeerConnected,
+		MaxInbound:        &maxInbound,
+		RetryDuration:     connectionRetryInterval,
+		TargetOutbound:    uint32(targetOutbound),
+		Dial:              btcdDial,
+		OnConnection:      s.outboundPeerConnected,
+		OnFailedToConnect: s.markConnReqFailed,
+		GetNewAddress:     newAddressFunc,
 	})
 	if err != nil {
 		return nil, err

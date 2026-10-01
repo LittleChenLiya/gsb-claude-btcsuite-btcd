@@ -144,6 +144,11 @@ type Config struct {
 	// connection is disconnected.
 	OnDisconnection func(*ConnReq)
 
+	// OnFailedToConnect is a callback that is fired when an outbound
+	// connection attempt fails to dial. It is not fired for connection
+	// requests that were canceled before the dial completed.
+	OnFailedToConnect func(*ConnReq)
+
 	// GetNewAddress is a way to get an address to make a network connection
 	// to.  If nil, no new connections will be made automatically.
 	GetNewAddress func() (net.Addr, error)
@@ -422,6 +427,11 @@ out:
 				connReq.updateState(ConnFailing)
 				log.Debugf("Failed to connect to %v: %v",
 					connReq, msg.err)
+
+				if cm.cfg.OnFailedToConnect != nil {
+					go cm.cfg.OnFailedToConnect(connReq)
+				}
+
 				cm.handleFailedConn(connReq, false)
 			}
 

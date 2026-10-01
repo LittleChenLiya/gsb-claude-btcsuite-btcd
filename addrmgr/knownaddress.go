@@ -20,6 +20,10 @@ type KnownAddress struct {
 	attempts    int
 	lastattempt time.Time
 	lastsuccess time.Time
+	// lastfailure is the time of the most recent failed connection attempt.
+	// It is used to enforce the optional failure cooldown window and is not
+	// persisted across restarts.
+	lastfailure time.Time
 	tried       bool
 	refs        int // reference count of new buckets
 }
@@ -37,6 +41,15 @@ func (ka *KnownAddress) LastAttempt() time.Time {
 	ka.mtx.RLock()
 	defer ka.mtx.RUnlock()
 	return ka.lastattempt
+}
+
+// LastFailure returns the time of the most recent failed connection attempt
+// recorded for the known address. The zero time is returned if the address
+// has never failed.
+func (ka *KnownAddress) LastFailure() time.Time {
+	ka.mtx.RLock()
+	defer ka.mtx.RUnlock()
+	return ka.lastfailure
 }
 
 // Services returns the services supported by the peer with the known address.
