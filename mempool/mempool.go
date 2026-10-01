@@ -41,6 +41,12 @@ const (
 	// scans of the orphan pool to evict expired transactions.
 	orphanExpireScanInterval = time.Minute * 5
 
+	// maxOrphanRejectTraces is the maximum number of orphan rejection
+	// traces that are retained in memory for diagnostics.  When the limit
+	// is exceeded the oldest trace is evicted so that memory usage stays
+	// bounded.
+	maxOrphanRejectTraces = 100
+
 	// MaxRBFSequence is the maximum sequence number an input can use to
 	// signal that the transaction spending it can be replaced using the
 	// Replace-By-Fee (RBF) policy.
@@ -175,6 +181,83 @@ type orphanTx struct {
 	expiration time.Time
 }
 
+// OrphanRejectReason identifies the high level category that caused an orphan
+// transaction to be rejected.
+type OrphanRejectReason uint8
+
+const (
+	// OrphanRejectMissingParent indicates that the transaction references
+	// one or more parent transactions (or outputs) that are not yet known
+	// to the node.  Such a rejection is always temporary: the transaction
+	// might become acceptable later once the missing parents arrive and
+	// must therefore never be treated as permanently invalid.
+	OrphanRejectMissingParent OrphanRejectReason = iota
+
+	// OrphanRejectPolicy indicates that the transaction is disallowed by
+	// local orphan-pool policy (for example it is larger than the maximum
+	// allowed orphan size or the orphan pool is disabled).  Rejections in
+	// this category are permanent for the current policy configuration.
+	OrphanRejectPolicy
+
+	// OrphanRejectInvalid indicates that the transaction was held as an
+	// orphan but failed full validation once its parents became available
+	// (for example an invalid signature or a double spend).  Rejections in
+	// this category are permanent: the transaction will never become
+	// valid without being modified.
+	OrphanRejectInvalid
+)
+
+// String returns a human readable identifier for the reject reason.
+func (r OrphanRejectReason) String() string {
+	switch r {
+	case OrphanRejectMissingParent:
+		return "missing_parent"
+	case OrphanRejectPolicy:
+		return "policy"
+	case OrphanRejectInvalid:
+		return "invalid"
+	default:
+		return "unknown"
+	}
+}
+
+// OrphanRejectTrace describes why an orphan transaction was rejected.  It is
+// the unit of "orphan rejection tracing" and allows an operator to tell apart
+// transactions that are merely waiting for missing parents from transactions
+// that violate policy or that are permanently invalid.
+type OrphanRejectTrace struct {
+	// TxHash is the hash of the rejected orphan transaction.
+	TxHash chainhash.Hash
+
+	// Reason categorizes the rejection.
+	Reason OrphanRejectReason
+
+	// Temporary is true when the rejection is only temporary, meaning the
+	// transaction could become acceptable at a later point without any
+	// modification.  It is only set to true for the missing-parent case so
+	// that a temporarily missing parent is never mistaken for a permanent
+	// invalidity.
+	Temporary bool
+
+	// RejectCode is the wire reject code associated with the rejection.
+	RejectCode wire.RejectCode
+
+	// Detail is a human readable explanation of the rejection.
+	Detail string
+
+	// MissingParents holds the hashes of the parent transactions that were
+	// not available.  It is only populated for the missing-parent reason and
+	// contains no duplicate hashes.
+	MissingParents []chainhash.Hash
+
+	// Tag is the tag (typically the peer id) of the source that relayed
+	// the rejected transaction, if known.
+	Tag Tag
+
+	// Time is the time at which the rejection was recorded.
+	Time time.Time
+}
+
 // TxPool is used as a source of transactions that need to be mined into blocks
 // and relayed to other peers.  It is safe for concurrent access from multiple
 // peers.
@@ -196,6 +279,13 @@ type TxPool struct {
 	// the scan will only run when an orphan is added to the pool as opposed
 	// to on an unconditional timer.
 	nextExpireScan time.Time
+
+	// orphanRejects retains the most recent orphan rejection traces, with
+	// the most recent trace at the end of the slice.  It is bounded by
+	// maxOrphanRejectTraces and is protected by mtx.  Recording traces only
+	// observes rejection events and never mutates transactions held in the
+	// main pool or the orphan pool.
+	orphanRejects []OrphanRejectTrace
 }
 
 // Ensure the TxPool type implements the mining.TxSource interface.
@@ -325,12 +415,63 @@ func (mp *TxPool) limitNumOrphans() error {
 	return nil
 }
 
+// recordOrphanReject appends an orphan rejection trace to the in-memory
+// diagnostics log, evicting the oldest trace once the log reaches its maximum
+// size.  It is purely observational: it does not add, remove or otherwise
+// mutate any transaction in either pool.
+//
+// This function MUST be called with the mempool lock held (for writes).
+func (mp *TxPool) recordOrphanReject(trace OrphanRejectTrace) {
+	trace.Time = time.Now()
+	mp.orphanRejects = append(mp.orphanRejects, trace)
+	if len(mp.orphanRejects) > maxOrphanRejectTraces {
+		mp.orphanRejects = mp.orphanRejects[len(mp.orphanRejects)-
+			maxOrphanRejectTraces:]
+	}
+
+	nature := "permanent"
+	if trace.Temporary {
+		nature = "temporary"
+	}
+	log.Debugf("Orphan rejection trace for tx %v: reason=%s %s "+
+		"code=%v missing_parents=%v detail=%q", trace.TxHash,
+		trace.Reason, nature, trace.RejectCode, trace.MissingParents,
+		trace.Detail)
+}
+
+// dedupParentHashes returns the unique hashes from the provided slice of parent
+// transaction hashes while preserving the first-seen order.
+func dedupParentHashes(parents []*chainhash.Hash) []chainhash.Hash {
+	seen := make(map[chainhash.Hash]struct{}, len(parents))
+	unique := make([]chainhash.Hash, 0, len(parents))
+	for _, parent := range parents {
+		if _, exists := seen[*parent]; exists {
+			continue
+		}
+		seen[*parent] = struct{}{}
+		unique = append(unique, *parent)
+	}
+	return unique
+}
+
 // addOrphan adds an orphan transaction to the orphan pool.
 //
 // This function MUST be called with the mempool lock held (for writes).
 func (mp *TxPool) addOrphan(tx *btcutil.Tx, tag Tag) {
 	// Nothing to do if no orphans are allowed.
 	if mp.cfg.Policy.MaxOrphanTxs <= 0 {
+		// Record a permanent policy rejection trace so that the
+		// dropped orphan can still be accounted for.  The historical
+		// behavior of silently accepting the call (returning nil) is
+		// preserved.
+		mp.recordOrphanReject(OrphanRejectTrace{
+			TxHash:     *tx.Hash(),
+			Reason:     OrphanRejectPolicy,
+			Temporary:  false,
+			RejectCode: wire.RejectNonstandard,
+			Detail:     "orphan pool is disabled (MaxOrphanTxs <= 0)",
+			Tag:        tag,
+		})
 		return
 	}
 
@@ -375,6 +516,19 @@ func (mp *TxPool) maybeAddOrphan(tx *btcutil.Tx, tag Tag) error {
 		str := fmt.Sprintf("orphan transaction size of %d bytes is "+
 			"larger than max allowed size of %d bytes",
 			serializedLen, mp.cfg.Policy.MaxOrphanTxSize)
+
+		// Record a permanent policy rejection trace.  A transaction
+		// that violates local orphan size policy is not a temporary
+		// orphan and must not be reported as one.
+		mp.recordOrphanReject(OrphanRejectTrace{
+			TxHash:     *tx.Hash(),
+			Reason:     OrphanRejectPolicy,
+			Temporary:  false,
+			RejectCode: wire.RejectNonstandard,
+			Detail:     str,
+			Tag:        tag,
+		})
+
 		return txRuleError(wire.RejectNonstandard, str)
 	}
 
@@ -448,6 +602,48 @@ func (mp *TxPool) IsOrphanInPool(hash *chainhash.Hash) bool {
 	mp.mtx.RUnlock()
 
 	return inPool
+}
+
+// orphanRejectTraces returns the retained orphan rejection traces, with the
+// most recent trace last.  The returned slice is a copy and may be used by the
+// caller without holding the pool lock.
+//
+// This function MUST be called with the mempool lock held (for reads).
+func (mp *TxPool) orphanRejectTraces() []OrphanRejectTrace {
+	traces := make([]OrphanRejectTrace, len(mp.orphanRejects))
+	copy(traces, mp.orphanRejects)
+	return traces
+}
+
+// OrphanRejectTraces returns a copy of the most recent orphan rejection
+// traces, ordered oldest first with the most recent trace last.  The log is
+// bounded in size and purely observational; it never contains references to
+// the pool transactions and never changes pool state.
+//
+// This function is safe for concurrent access.
+func (mp *TxPool) OrphanRejectTraces() []OrphanRejectTrace {
+	mp.mtx.RLock()
+	traces := mp.orphanRejectTraces()
+	mp.mtx.RUnlock()
+
+	return traces
+}
+
+// OrphanRejectTraceForTx returns the most recent orphan rejection trace
+// recorded for the passed transaction hash along with true when one exists.
+// The returned trace is a copy.
+//
+// This function is safe for concurrent access.
+func (mp *TxPool) OrphanRejectTraceForTx(hash *chainhash.Hash) (OrphanRejectTrace, bool) {
+	mp.mtx.RLock()
+	defer mp.mtx.RUnlock()
+
+	for i := len(mp.orphanRejects) - 1; i >= 0; i-- {
+		if mp.orphanRejects[i].TxHash == *hash {
+			return mp.orphanRejects[i], true
+		}
+	}
+	return OrphanRejectTrace{}, false
 }
 
 // haveTransaction returns whether or not the passed transaction already exists
@@ -1033,6 +1229,27 @@ func (mp *TxPool) processOrphans(acceptedTx *btcutil.Tx) []*TxDesc {
 					// is no way any other orphans which
 					// redeem any of its outputs can be
 					// accepted.  Remove them.
+					//
+					// Record a permanent invalidity trace.
+					// Note that a transaction which still
+					// has missing parents is NOT an error
+					// and therefore does not reach here, so
+					// a temporarily orphaned transaction is
+					// never misreported as permanently
+					// invalid.
+					tag := Tag(0)
+					if otx, exists := mp.orphans[*tx.Hash()]; exists {
+						tag = otx.tag
+					}
+					rejectCode, _ := extractRejectCode(err)
+					mp.recordOrphanReject(OrphanRejectTrace{
+						TxHash:     *tx.Hash(),
+						Reason:     OrphanRejectInvalid,
+						Temporary:  false,
+						RejectCode: rejectCode,
+						Detail:     err.Error(),
+						Tag:        tag,
+					})
 					mp.removeOrphan(tx, true)
 					break
 				}
@@ -1147,7 +1364,25 @@ func (mp *TxPool) ProcessTransaction(tx *btcutil.Tx, allowOrphan, rateLimit bool
 		str := fmt.Sprintf("orphan transaction %v references "+
 			"outputs of unknown or fully-spent "+
 			"transaction %v", tx.Hash(), missingParents[0])
-		return nil, txRuleError(wire.RejectDuplicate, str)
+		rejectErr := txRuleError(wire.RejectDuplicate, str)
+
+		// Record a temporary rejection trace.  The transaction is
+		// only missing parent transactions; it is not invalid and may
+		// become acceptable once the parents arrive, so the trace is
+		// explicitly marked temporary and must never be confused with a
+		// permanent policy or validity rejection.  No transaction is
+		// added to either pool.
+		mp.recordOrphanReject(OrphanRejectTrace{
+			TxHash:         *tx.Hash(),
+			Reason:         OrphanRejectMissingParent,
+			Temporary:      true,
+			RejectCode:     wire.RejectDuplicate,
+			Detail:         str,
+			MissingParents: dedupParentHashes(missingParents),
+			Tag:            tag,
+		})
+
+		return nil, rejectErr
 	}
 
 	// Potentially add the orphan transaction to the orphan pool.
