@@ -68,7 +68,256 @@ func TestInv(t *testing.T) {
 	}
 }
 
-// TestInvWire tests the MsgInv wire encode and decode for various numbers
+// TestInvDedup tests the optional duplicate-compressing inv message
+// constructor.
+func TestInvDedup(t *testing.T) {
+	// A handful of distinct hashes used to build inventory vectors.
+	hashes := make([]*chainhash.Hash, 4)
+	for i := range hashes {
+		h := chainhash.Hash{byte(i + 1)}
+		hashes[i] = &h
+	}
+
+	tests := []struct {
+		name string
+		add  func(*MsgInv) []*InvVect // vectors to add, in order
+		want []*InvVect               // vectors expected after compression
+	}{
+		{
+			name: "duplicate hashes are compressed to first occurrence",
+			add: func(msg *MsgInv) []*InvVect {
+				v0 := NewInvVect(InvTypeBlock, hashes[0])
+				msg.AddInvVect(v0)
+				msg.AddInvVect(v0)
+				msg.AddInvVect(v0)
+				return []*InvVect{v0}
+			},
+		},
+		{
+			name: "order of first occurrence is preserved",
+			add: func(msg *MsgInv) []*InvVect {
+				v0 := NewInvVect(InvTypeBlock, hashes[0])
+				v1 := NewInvVect(InvTypeTx, hashes[1])
+				v2 := NewInvVect(InvTypeBlock, hashes[2])
+				msg.AddInvVect(v0)
+				msg.AddInvVect(v1)
+				msg.AddInvVect(v0) // duplicate of v0
+				msg.AddInvVect(v2)
+				msg.AddInvVect(v1) // duplicate of v1
+				return []*InvVect{v0, v1, v2}
+			},
+		},
+		{
+			name: "same hash under different types is kept",
+			add: func(msg *MsgInv) []*InvVect {
+				blockVect := NewInvVect(InvTypeBlock, hashes[3])
+				txVect := NewInvVect(InvTypeTx, hashes[3])
+				msg.AddInvVect(blockVect)
+				msg.AddInvVect(txVect)
+				msg.AddInvVect(blockVect) // duplicate of the block vector
+				return []*InvVect{blockVect, txVect}
+			},
+		},
+	}
+
+	for _, test := range tests {
+		msg := NewMsgInvDedup()
+		want := test.add(msg)
+		if len(msg.InvList) != len(want) {
+			t.Errorf("%s: wrong length - got %v, want %v",
+				test.name, len(msg.InvList), len(want))
+			continue
+		}
+		for i := range want {
+			if msg.InvList[i] != want[i] {
+				t.Errorf("%s: wrong vector at index %d - got %v, want %v",
+					test.name, i, spew.Sdump(msg.InvList[i]),
+					spew.Sdump(want[i]))
+			}
+		}
+	}
+
+	// The default constructors must keep duplicates, i.e. default
+	// serialization is unchanged.
+	defaultMsg := NewMsgInv()
+	v := NewInvVect(InvTypeBlock, hashes[0])
+	for i := 0; i < 3; i++ {
+		if err := defaultMsg.AddInvVect(v); err != nil {
+			t.Fatalf("AddInvVect: unexpected error: %v", err)
+		}
+	}
+	if len(defaultMsg.InvList) != 3 {
+		t.Errorf("default MsgInv should keep duplicates - got %v, want 3",
+			len(defaultMsg.InvList))
+	}
+}
+
+// TestInvDedupCapacity ensures the capacity limit is enforced before any
+// deduplication takes place.
+func TestInvDedupCapacity(t *testing.T) {
+	// Fill a dedup message to the max with distinct vectors.
+	msg := NewMsgInvDedup()
+	ivs := make([]*InvVect, MaxInvPerMsg)
+	for i := 0; i < MaxInvPerMsg; i++ {
+		h := chainhash.Hash{byte(i), byte(i >> 8), byte(i >> 16)}
+		ivs[i] = NewInvVect(InvTypeTx, &h)
+		if err := msg.AddInvVect(ivs[i]); err != nil {
+			t.Fatalf("AddInvVect #%d: unexpected error: %v", i, err)
+		}
+	}
+	if len(msg.InvList) != MaxInvPerMsg {
+		t.Fatalf("wrong length after filling - got %v, want %v",
+			len(msg.InvList), MaxInvPerMsg)
+	}
+
+	// Adding one more distinct vector must fail with the capacity error.
+	extra := NewInvVect(InvTypeBlock, &chainhash.Hash{0xff, 0xff})
+	if err := msg.AddInvVect(extra); err == nil {
+		t.Errorf("AddInvVect: expected capacity error for %d vectors",
+			MaxInvPerMsg+1)
+	}
+
+	// Adding a duplicate once the message is full must also fail: the
+	// capacity check runs before deduplication.
+	if err := msg.AddInvVect(ivs[0]); err == nil {
+		t.Errorf("AddInvVect: expected capacity error for duplicate " +
+			"vector once at max capacity")
+	}
+	if len(msg.InvList) != MaxInvPerMsg {
+		t.Errorf("length changed after rejected adds - got %v, want %v",
+			len(msg.InvList), MaxInvPerMsg)
+	}
+
+	// By contrast, a duplicate added while there is still room is silently
+	// compressed out.
+	roomy := NewMsgInvDedup()
+	if err := roomy.AddInvVect(ivs[0]); err != nil {
+		t.Fatalf("AddInvVect: unexpected error: %v", err)
+	}
+	if err := roomy.AddInvVect(ivs[0]); err != nil {
+		t.Fatalf("AddInvVect duplicate: unexpected error: %v", err)
+	}
+	if len(roomy.InvList) != 1 {
+		t.Errorf("duplicate with room: wrong length - got %v, want 1",
+			len(roomy.InvList))
+	}
+}
+
+// TestInvDedupWire ensures the wire encoding of a dedup message is byte for
+// byte identical to the original protocol encoding produced by a normal
+// message, and that decoding a stream with duplicates into a dedup message
+// compresses them while decoding into a normal message keeps them.
+func TestInvDedupWire(t *testing.T) {
+	hash0 := chainhash.Hash{0x01}
+	hash1 := chainhash.Hash{0x02}
+	hash2 := chainhash.Hash{0x03}
+	blockVect := NewInvVect(InvTypeBlock, &hash0)
+	txVect := NewInvVect(InvTypeTx, &hash1)
+	blockVect2 := NewInvVect(InvTypeBlock, &hash2)
+
+	// Dedup message with duplicates added out of order.
+	dedupMsg := NewMsgInvDedup()
+	dedupMsg.AddInvVect(blockVect)
+	dedupMsg.AddInvVect(txVect)
+	dedupMsg.AddInvVect(blockVect) // duplicate of blockVect
+	dedupMsg.AddInvVect(blockVect2)
+	dedupMsg.AddInvVect(txVect) // duplicate of txVect
+
+	// Normal message carrying only the unique vectors, in first-occurrence
+	// order.
+	normalMsg := NewMsgInv()
+	normalMsg.AddInvVect(blockVect)
+	normalMsg.AddInvVect(txVect)
+	normalMsg.AddInvVect(blockVect2)
+
+	if len(dedupMsg.InvList) != 3 {
+		t.Fatalf("dedup message: wrong length - got %v, want 3",
+			len(dedupMsg.InvList))
+	}
+
+	var dedupBuf, normalBuf bytes.Buffer
+	if err := dedupMsg.BtcEncode(&dedupBuf, ProtocolVersion, BaseEncoding); err != nil {
+		t.Fatalf("BtcEncode dedup: %v", err)
+	}
+	if err := normalMsg.BtcEncode(&normalBuf, ProtocolVersion, BaseEncoding); err != nil {
+		t.Fatalf("BtcEncode normal: %v", err)
+	}
+	if !bytes.Equal(dedupBuf.Bytes(), normalBuf.Bytes()) {
+		t.Errorf("dedup encoding differs from original protocol encoding\n"+
+			"got: %s\nwant: %s", spew.Sdump(dedupBuf.Bytes()),
+			spew.Sdump(normalBuf.Bytes()))
+	}
+
+	// Build a wire stream that carries 5 vectors with duplicates.
+	ladenMsg := NewMsgInv()
+	ladenMsg.AddInvVect(blockVect)
+	ladenMsg.AddInvVect(txVect)
+	ladenMsg.AddInvVect(blockVect) // duplicate of blockVect
+	ladenMsg.AddInvVect(blockVect2)
+	ladenMsg.AddInvVect(txVect) // duplicate of txVect
+	var ladenBuf bytes.Buffer
+	if err := ladenMsg.BtcEncode(&ladenBuf, ProtocolVersion, BaseEncoding); err != nil {
+		t.Fatalf("BtcEncode laden: %v", err)
+	}
+
+	// Decoding the duplicate-laden stream into a dedup message compresses
+	// the duplicates while preserving first-occurrence order.
+	decodedDedup := NewMsgInvDedup()
+	if err := decodedDedup.BtcDecode(bytes.NewReader(ladenBuf.Bytes()),
+		ProtocolVersion, BaseEncoding); err != nil {
+		t.Fatalf("BtcDecode dedup: %v", err)
+	}
+	if len(decodedDedup.InvList) != 3 {
+		t.Errorf("decode into dedup: wrong length - got %v, want 3",
+			len(decodedDedup.InvList))
+	}
+	wantDecoded := []*InvVect{blockVect, txVect, blockVect2}
+	for i, want := range wantDecoded {
+		got := decodedDedup.InvList[i]
+		if got.Type != want.Type || got.Hash != want.Hash {
+			t.Errorf("decode into dedup: wrong vector at index %d - "+
+				"got %v, want %v", i, spew.Sdump(got),
+				spew.Sdump(want))
+		}
+	}
+
+	// Decoding the same stream into a normal message keeps every vector,
+	// confirming default behavior is unchanged.
+	var decodedNormal MsgInv
+	if err := decodedNormal.BtcDecode(bytes.NewReader(ladenBuf.Bytes()),
+		ProtocolVersion, BaseEncoding); err != nil {
+		t.Fatalf("BtcDecode normal: %v", err)
+	}
+	if len(decodedNormal.InvList) != 5 {
+		t.Errorf("decode into normal: wrong length - got %v, want 5",
+			len(decodedNormal.InvList))
+	}
+
+	// A wire stream claiming more than the max count is rejected at decode
+	// time before any deduplication, even though the duplicates it carries
+	// would compress it below the limit.  Build such a stream by hand:
+	// varint count 50001 followed by 50001 copies of one vector.
+	var oneBuf bytes.Buffer
+	oneMsg := NewMsgInv()
+	oneMsg.AddInvVect(blockVect)
+	if err := oneMsg.BtcEncode(&oneBuf, ProtocolVersion, BaseEncoding); err != nil {
+		t.Fatalf("BtcEncode one vector: %v", err)
+	}
+	vectBytes := oneBuf.Bytes()[1:] // strip the count varint
+	overStream := append([]byte{0xfd, 0x51, 0xc3},
+		bytes.Repeat(vectBytes, MaxInvPerMsg+1)...)
+
+	var overMsg MsgInv
+	overMsg.dedup = true
+	err := overMsg.BtcDecode(bytes.NewReader(overStream), ProtocolVersion,
+		BaseEncoding)
+	if err == nil {
+		t.Errorf("BtcDecode: expected error for count %d", MaxInvPerMsg+1)
+	} else if _, ok := err.(*MessageError); !ok {
+		t.Errorf("BtcDecode: expected MessageError, got %T: %v", err, err)
+	}
+}
+
 // of inventory vectors and protocol versions.
 func TestInvWire(t *testing.T) {
 	// Block 203707 hash.
