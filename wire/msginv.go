@@ -125,6 +125,56 @@ func NewMsgInv() *MsgInv {
 	}
 }
 
+// NewMsgInvFromInvVects returns a new bitcoin inv message that conforms to the
+// Message interface and is pre-populated with the provided inventory vectors.
+//
+// When dedup is true, duplicate inventory vectors are compressed away while
+// the order of first occurrence is preserved.  Two inventory vectors are
+// considered duplicates only when both their Type and Hash match, so vectors
+// which share the same hash but use different types (for example a block and
+// a filtered block announcement) are both retained.
+//
+// When dedup is false the result is equivalent to building the message with
+// NewMsgInv and adding each vector with AddInvVect, so the default wire
+// serialization is unchanged.
+//
+// As with AddInvVect the number of provided vectors is limited to
+// MaxInvPerMsg.  The limit is intentionally enforced before any de-duplication
+// takes place, so an over-limit input slice results in an error even when it
+// contains duplicates that would compress below the limit.
+func NewMsgInvFromInvVects(ivs []*InvVect, dedup bool) (*MsgInv, error) {
+	// Limit to the maximum number of inventory vectors per message before
+	// de-duplicating.  Checking the raw input capacity first means callers
+	// cannot smuggle an over-limit list through the constructor by relying
+	// on compression to shrink it.
+	if len(ivs) > MaxInvPerMsg {
+		str := fmt.Sprintf("too many invvect in message [max %v]",
+			MaxInvPerMsg)
+		return nil, messageError("MsgInv.NewMsgInvFromInvVects", str)
+	}
+
+	msg := NewMsgInvSizeHint(uint(len(ivs)))
+	if !dedup {
+		msg.InvList = append(msg.InvList, ivs...)
+		return msg, nil
+	}
+
+	// Compress duplicates while retaining the order of first occurrence.
+	// InvVect is comparable (a uint32 and a fixed-size byte array), so it
+	// can be used directly as a map key.
+	seen := make(map[InvVect]struct{}, len(ivs))
+	for _, iv := range ivs {
+		if iv != nil {
+			if _, exists := seen[*iv]; exists {
+				continue
+			}
+			seen[*iv] = struct{}{}
+		}
+		msg.InvList = append(msg.InvList, iv)
+	}
+	return msg, nil
+}
+
 // NewMsgInvSizeHint returns a new bitcoin inv message that conforms to the
 // Message interface.  See MsgInv for details.  This function differs from
 // NewMsgInv in that it allows a default allocation size for the backing array
